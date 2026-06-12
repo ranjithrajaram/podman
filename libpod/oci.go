@@ -230,6 +230,8 @@ type ExecOptions struct {
 	ExitCommandDelay uint
 	// Privileged indicates the execed process will be launched in Privileged mode
 	Privileged bool
+	// CgroupPath is the optional sub-cgroup path for the exec process.
+	CgroupPath string
 }
 
 // HTTPAttachStreams informs the HTTPAttach endpoint which of the container's
