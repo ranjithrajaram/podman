@@ -120,11 +120,10 @@ func waitForFd(fd int, events int16, quit <-chan struct{}) error {
 			if pollFds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
 				return fmt.Errorf("fd error status")
 			}
-			if pollFds[0].Revents&events != 0 {
+			// If we got the event we wanted, or if the socket hung up (EOF/POLLHUP),
+			// return nil to let the caller read EOF (0 bytes) or fail.
+			if pollFds[0].Revents&(events|unix.POLLHUP) != 0 {
 				return nil
-			}
-			if pollFds[0].Revents&unix.POLLHUP != 0 {
-				return fmt.Errorf("hangup")
 			}
 		}
 	}
@@ -159,6 +158,9 @@ func spliceCopy(dstFd, srcFd int, quit <-chan struct{}) error {
 
 		n, err := unix.Splice(srcFd, nil, pipeWrite, nil, 65536, unix.SPLICE_F_NONBLOCK|unix.SPLICE_F_MOVE)
 		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				if err := waitForFd(srcFd, unix.POLLIN, quit); err != nil {
 					return err
@@ -181,6 +183,9 @@ func spliceCopy(dstFd, srcFd int, quit <-chan struct{}) error {
 
 			m, err := unix.Splice(pipeRead, nil, dstFd, nil, int(inPipe), unix.SPLICE_F_NONBLOCK|unix.SPLICE_F_MOVE)
 			if err != nil {
+				if err == unix.EINTR {
+					continue
+				}
 				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 					if err := waitForFd(dstFd, unix.POLLOUT, quit); err != nil {
 						return err
@@ -197,14 +202,32 @@ func spliceCopy(dstFd, srcFd int, quit <-chan struct{}) error {
 	}
 }
 
+// probeSplice checks if the splice(2) system call is supported and not blocked by seccomp
+func probeSplice() bool {
+	var pipeFds [2]int
+	if err := unix.Pipe2(pipeFds[:], unix.O_CLOEXEC|unix.O_NONBLOCK); err != nil {
+		return false
+	}
+	defer unix.Close(pipeFds[0])
+	defer unix.Close(pipeFds[1])
+
+	_, err := unix.Splice(pipeFds[0], nil, pipeFds[1], nil, 0, unix.SPLICE_F_NONBLOCK)
+	if err != nil {
+		if err == unix.ENOSYS || err == unix.EPERM || err == unix.EACCES || err == unix.EINVAL {
+			return false
+		}
+	}
+	return true
+}
+
 // bicopy is based on libnetwork/cmd/proxy/tcp_proxy.go .
 // NOTE: sendfile(2) cannot be used for sockets
 func bicopy(x, y net.Conn, quit <-chan struct{}) {
 	xFd, errX := getRawFd(x)
 	yFd, errY := getRawFd(y)
 
-	// Fallback to standard io.Copy if we cannot get raw fds
-	if errX != nil || errY != nil {
+	// Fallback to standard io.Copy if we cannot get raw fds or splice is unavailable/blocked
+	if errX != nil || errY != nil || !probeSplice() {
 		var wg sync.WaitGroup
 		var broker = func(to, from net.Conn) {
 			io.Copy(to, from)
