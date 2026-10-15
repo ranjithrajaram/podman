@@ -263,13 +263,27 @@ func (n *netavarkNetwork) pestoTeardown(opts types.NetworkOptions) error {
 func (n *netavarkNetwork) Teardown(namespacePath string, options types.TeardownOptions) error {
 	n.lock.Lock()
 	defer n.lock.Unlock()
-	err := n.loadNetworks()
-	if err != nil {
-		return err
+
+	// networkNames is used by the fallback IPAM path when the normal path
+	// (which needs n.networks) is unavailable.
+	networkNames := make([]string, 0, len(options.Networks))
+	for _, net := range options.Networks {
+		networkNames = append(networkNames, net.Name)
+	}
+
+	loadErr := n.loadNetworks()
+	if loadErr != nil {
+		// loadNetworks failed — we cannot run netavark teardown or the normal
+		// deallocIPs path (both depend on n.networks).  Use the fallback IPAM
+		// deallocation which works by scanning the raw boltdb buckets.
+		if err := n.deallocIPsByContainerID(options.ContainerID, networkNames); err != nil {
+			logrus.Errorf("IPAM fallback cleanup after loadNetworks failure: %v", err)
+		}
+		return loadErr
 	}
 
 	// get IPs from the IPAM db
-	err = n.getAssignedIPs(&options.NetworkOptions)
+	err := n.getAssignedIPs(&options.NetworkOptions)
 	if err != nil {
 		// when there is an error getting the ips we should still continue
 		// to call teardown for netavark to prevent leaking network interfaces
@@ -291,6 +305,17 @@ func (n *netavarkNetwork) Teardown(namespacePath string, options types.TeardownO
 
 	netavarkOpts, needPlugin, err := n.convertNetOpts(options.NetworkOptions)
 	if err != nil {
+		// convertNetOpts failed (e.g., network not in config cache) so we
+		// cannot run the netavark binary.  Still free IPAM entries so that the
+		// IP is not stranded permanently: first try the normal path (StaticIPs
+		// may already be populated by getAssignedIPs above), then fall back to
+		// the raw-scan path which does not need n.networks.
+		if deallocErr := n.deallocIPs(&options.NetworkOptions); deallocErr != nil {
+			logrus.Warnf("IPAM normal dealloc after convertNetOpts failure: %v; trying fallback", deallocErr)
+			if deallocErr = n.deallocIPsByContainerID(options.ContainerID, networkNames); deallocErr != nil {
+				logrus.Errorf("IPAM fallback dealloc after convertNetOpts failure: %v", deallocErr)
+			}
+		}
 		return fmt.Errorf("failed to convert net opts: %w", err)
 	}
 

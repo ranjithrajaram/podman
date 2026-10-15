@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 	"go.podman.io/common/libnetwork/etchosts"
@@ -93,8 +94,93 @@ func networkNamesFromOpts(nets []types.NamedPerNetworkOptions) []string {
 
 // setUpNetwork will set up the networks, on error it will also tear down the
 // networks. If rootless it will join/create the rootless network namespace.
+// On IPAM exhaustion it attempts a one-shot recovery: containers in Stopped
+// state that still hold IP allocations are cleaned up before retrying.
 func (r *Runtime) setUpNetwork(ns string, opts types.NetworkOptions) (map[string]types.StatusBlock, error) {
-	return r.network.Setup(ns, types.SetupOptions{NetworkOptions: opts})
+	result, err := r.network.Setup(ns, types.SetupOptions{NetworkOptions: opts})
+	if err == nil {
+		return result, nil
+	}
+	if !isIPAMExhaustedError(err) {
+		return nil, err
+	}
+	if n := r.reclaimStoppedContainerIPAM(opts); n > 0 {
+		logrus.Infof("Reclaimed IPAM allocations from %d stopped containers, retrying network setup", n)
+		result, err = r.network.Setup(ns, types.SetupOptions{NetworkOptions: opts})
+	}
+	return result, err
+}
+
+// isIPAMExhaustedError returns true when err is an IPAM range-full error from
+// the netavark network backend.
+func isIPAMExhaustedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "IPAM error") && strings.Contains(msg, "failed to find free IP")
+}
+
+// reclaimStoppedContainerIPAM frees IPAM allocations held by containers in
+// Stopped state that are connected to one of the networks in opts.  Stopped
+// containers have exited but have not yet had cleanupNetwork() called (e.g.
+// because the conmon exit command did not run after a service restart).
+// Returns the number of containers whose network resources were freed.
+func (r *Runtime) reclaimStoppedContainerIPAM(opts types.NetworkOptions) int {
+	targetNets := make(map[string]struct{}, len(opts.Networks))
+	for _, n := range opts.Networks {
+		targetNets[n.Name] = struct{}{}
+	}
+
+	ctrs, err := r.state.AllContainers(false)
+	if err != nil {
+		logrus.Errorf("IPAM reclaim: listing containers: %v", err)
+		return 0
+	}
+
+	reclaimed := 0
+	for _, ctr := range ctrs {
+		// Only reclaim from containers that have stopped but whose network
+		// has not been torn down yet (NetNS is still set).
+		if ctr.state.State == define.ContainerStateRunning ||
+			ctr.state.State == define.ContainerStatePaused ||
+			ctr.state.NetNS == "" {
+			continue
+		}
+
+		ctrNets, err := ctr.networks()
+		if err != nil {
+			continue
+		}
+		onTarget := false
+		for _, cn := range ctrNets {
+			if _, ok := targetNets[cn.Name]; ok {
+				onTarget = true
+				break
+			}
+		}
+		if !onTarget {
+			continue
+		}
+
+		// teardownNetworkBackend does not require the container lock and
+		// directly calls the network backend Teardown which frees IPAM.
+		netOpts := ctr.getNetworkOptions(ctrNets)
+		if err := r.teardownNetworkBackend(ctr.state.NetNS, netOpts); err != nil {
+			logrus.Warnf("IPAM reclaim: tearing down network for stopped container %s: %v", ctr.ID(), err)
+			continue
+		}
+
+		// Clear the NetNS in state so subsequent cleanupNetwork calls are
+		// no-ops rather than attempting a double-teardown.
+		ctr.state.NetNS = ""
+		ctr.state.NetworkStatus = nil
+		if err := ctr.save(); err != nil {
+			logrus.Warnf("IPAM reclaim: saving state for container %s: %v", ctr.ID(), err)
+		}
+		reclaimed++
+	}
+	return reclaimed
 }
 
 // getNetworkPodName return the pod name (hostname) used by dns backend.

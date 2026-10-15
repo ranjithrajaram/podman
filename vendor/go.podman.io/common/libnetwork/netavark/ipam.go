@@ -369,6 +369,89 @@ func (n *netavarkNetwork) deallocIPs(opts *types.NetworkOptions) error {
 	return err
 }
 
+// deallocIPsByContainerID frees IPAM entries for a container by scanning the
+// network's IPAM buckets directly, without requiring n.networks to be loaded.
+// This is a fallback path used when the normal deallocIPs path is unavailable
+// (e.g., the network config cache could not be loaded).  It iterates every
+// sub-bucket of the named network bucket, treats non-"ids" sub-buckets as
+// subnet buckets, reads the IPs assigned to opts.ContainerID from the ids
+// bucket, and deletes the corresponding entries.
+func (n *netavarkNetwork) deallocIPsByContainerID(containerID string, networkNames []string) error {
+	db, err := n.openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var firstErr error
+	recordErr := func(e error) {
+		if firstErr == nil {
+			firstErr = e
+		}
+	}
+
+	return db.Update(func(tx *bbolt.Tx) error {
+		for _, netName := range networkNames {
+			netBkt := tx.Bucket([]byte(netName))
+			if netBkt == nil {
+				// No bucket for this network — nothing to free.
+				continue
+			}
+
+			// Collect the IPs assigned to this container from the ids bucket.
+			idsBkt := netBkt.Bucket(idBucketKey)
+			if idsBkt == nil {
+				continue
+			}
+			ipJSON := idsBkt.Get([]byte(containerID))
+			if ipJSON == nil {
+				// Container has no IPAM entry in this network.
+				continue
+			}
+			var assignedIPs []net.IP
+			if err := json.Unmarshal(ipJSON, &assignedIPs); err != nil {
+				recordErr(newIPAMError(err, "failed to unmarshal ips for container %s in network %s", containerID, netName))
+				continue
+			}
+
+			// Build a set for O(1) lookup.
+			ipSet := make(map[string]net.IP, len(assignedIPs))
+			for _, ip := range assignedIPs {
+				util.NormalizeIP(&ip)
+				ipSet[string(ip)] = ip
+			}
+
+			// Walk every sub-bucket; non-"ids" ones are subnet buckets.
+			if err := netBkt.ForEach(func(k, v []byte) error {
+				if v != nil || string(k) == idBucket {
+					return nil // skip non-bucket keys and the ids bucket itself
+				}
+				subnetBkt := netBkt.Bucket(k)
+				if subnetBkt == nil {
+					return nil
+				}
+				for rawIP := range ipSet {
+					if subnetBkt.Get([]byte(rawIP)) != nil {
+						if err := subnetBkt.Delete([]byte(rawIP)); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}); err != nil {
+				recordErr(newIPAMError(err, "scanning subnet buckets for network %s: %w", netName, err))
+				continue
+			}
+
+			// Remove the container from the ids bucket.
+			if err := idsBkt.Delete([]byte(containerID)); err != nil {
+				recordErr(newIPAMError(err, "removing container %s from ids bucket for network %s", containerID, netName))
+			}
+		}
+		return firstErr
+	})
+}
+
 func (n *netavarkNetwork) removeNetworkIPAMBucket(network *types.Network) error {
 	if !requiresIPAMAlloc(network) {
 		return nil

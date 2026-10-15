@@ -909,6 +909,30 @@ func (r *Runtime) refresh(ctx context.Context, alivePath string) error {
 
 	// Clear state of database if not running in container
 	if !graphRootMounted() {
+		// Before clearing the state, tear down network resources for any
+		// container that still has a NetNS recorded.  resetContainerState()
+		// (called inside state.Refresh) zeroes NetNS, which makes
+		// cleanupNetwork() a no-op afterwards.  When the IPAM database lives
+		// on a path that survives restarts (i.e. not a tmpfs /run mount), this
+		// causes those IP allocations to be stranded permanently, exhausting
+		// the subnet.  Tearing down before the state reset frees them.
+		preClearCtrs, err := r.state.AllContainers(false)
+		if err == nil {
+			for _, ctr := range preClearCtrs {
+				if ctr.state.NetNS == "" {
+					continue
+				}
+				networks, err := ctr.networks()
+				if err != nil || len(networks) == 0 {
+					continue
+				}
+				netOpts := ctr.getNetworkOptions(networks)
+				if err := r.teardownNetworkBackend(ctr.state.NetNS, netOpts); err != nil {
+					logrus.Warnf("Error releasing network resources for container %s during refresh: %v", ctr.ID(), err)
+				}
+			}
+		}
+
 		// First clear the state in the database
 		if err := r.state.Refresh(); err != nil {
 			return err
