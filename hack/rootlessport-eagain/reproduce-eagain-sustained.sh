@@ -44,9 +44,16 @@
 #   --probe-every  S   Seconds between curl probes (default: 3)
 #   --body-size    B   Response bytes per request (default: 131072 = 128 KB)
 #   --duration     S   Total run time in seconds, 0 = run until Ctrl+C (default: 0)
+#   --strace           Attach strace to rootlessport and print EAGAIN→resume
+#                      gaps directly to the console as they occur.
+#                      Does NOT require root on owned processes (kernel ptrace_scope 1).
+#   --gap-ms       N   Minimum EAGAIN→resume gap in ms to print (default: 100)
+#   --strace-log   F   Also write [STRACE] lines to this file (default: strace-gaps.log
+#                      in the script's temp dir). Use - to disable file logging.
 #   --no-cleanup       Leave pod running after exit
 #
 # Requirements: rootless podman, python3, curl
+# Optional:     strace (--strace flag)
 
 set -euo pipefail
 
@@ -60,6 +67,9 @@ RATE=5              # max req/s per connection (0 = unlimited)
 PROBE_EVERY=3       # curl probe interval in seconds
 BODY_SIZE=131072    # 128 KB — two splice pipe fills per response
 DURATION=0          # 0 = run until Ctrl+C
+STRACE=0            # attach strace to rootlessport and print EAGAIN gaps
+GAP_MS=100          # minimum EAGAIN→resume gap in ms to print
+STRACE_LOG=""       # dedicated log file for [STRACE] lines (set after TMPDIR_ROOT is known)
 NO_CLEANUP=0
 
 POD_NAME="eagain-sustained-pod"
@@ -87,6 +97,9 @@ while [[ $# -gt 0 ]]; do
         --probe-every) PROBE_EVERY="$2"; shift 2 ;;
         --body-size)   BODY_SIZE="$2";   shift 2 ;;
         --duration)    DURATION="$2";    shift 2 ;;
+        --strace)      STRACE=1;          shift   ;;
+        --gap-ms)      GAP_MS="$2";       shift 2 ;;
+        --strace-log)  STRACE_LOG="$2";   shift 2 ;;
         --no-cleanup)  NO_CLEANUP=1;     shift   ;;
         *) err "Unknown option: $1"; exit 1 ;;
     esac
@@ -143,22 +156,8 @@ podman pod create \
     --publish "${DIRECT_PORT}:8081"
 ok "Pod created"
 
-# ---------------------------------------------------------------------------
-step "Verify rootlessport is running"
-# ---------------------------------------------------------------------------
-ROOTLESSPORT_PID=""
-for i in $(seq 1 10); do
-    ROOTLESSPORT_PID=$(pgrep -f "rootlessport" 2>/dev/null | head -1 || true)
-    [[ -n "$ROOTLESSPORT_PID" ]] && break
-    sleep 1
-done
-if [[ -n "$ROOTLESSPORT_PID" ]]; then
-    ROOTLESSPORT_EXE=$(readlink -f "/proc/${ROOTLESSPORT_PID}/exe" 2>/dev/null || echo "unknown")
-    ok "rootlessport PID $ROOTLESSPORT_PID  ($ROOTLESSPORT_EXE)"
-else
-    err "rootlessport not found — check 'podman info | grep networkBackend'"
-    exit 1
-fi
+# rootlessport starts when the first container runs, not at pod create.
+# The check is deferred to after containers start (after readiness wait).
 
 # ---------------------------------------------------------------------------
 step "Write Envoy config"
@@ -274,6 +273,26 @@ for i in $(seq 1 90); do
     [[ $(( i % 15 )) -eq 0 ]] && info "  still waiting... ($i s)"
 done
 [[ "$READY_ENVOY" -eq 0 || "$READY_DIRECT" -eq 0 ]] && { err "Services not ready"; exit 1; }
+
+# ---------------------------------------------------------------------------
+step "Verify rootlessport is running"
+# ---------------------------------------------------------------------------
+# rootlessport starts when the first container in the pod runs.
+# Use pgrep -f on the binary path so it matches regardless of comm truncation.
+ROOTLESSPORT_PID=""
+for i in $(seq 1 10); do
+    ROOTLESSPORT_PID=$(pgrep -x rootlessport 2>/dev/null | head -1 || true)
+    [[ -n "$ROOTLESSPORT_PID" ]] && break
+    sleep 1
+done
+if [[ -n "$ROOTLESSPORT_PID" ]]; then
+    ROOTLESSPORT_EXE=$(readlink -f "/proc/${ROOTLESSPORT_PID}/exe" 2>/dev/null || echo "unknown")
+    ok "rootlessport PID $ROOTLESSPORT_PID  ($ROOTLESSPORT_EXE)"
+    info "  Binary size: $(ls -lh "$ROOTLESSPORT_EXE" 2>/dev/null | awk '{print $5}')  (patched=3.0M unpatched=3.5M)"
+else
+    err "rootlessport not found — check 'podman info | grep networkBackend'"
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 step "Write low-CPU background load generator"
@@ -397,17 +416,127 @@ info "  Expected CPU from load generator: ~$(( CONNS * RATE / 10 ))–$(( CONNS 
 sleep 5
 
 # ---------------------------------------------------------------------------
+# Optional: strace EAGAIN gap processor
+# ---------------------------------------------------------------------------
+STRACE_PID=""
+if [[ "$STRACE" -eq 1 ]]; then
+    step "Starting strace EAGAIN gap monitor"
+
+    if ! command -v strace &>/dev/null; then
+        err "strace not found — install with: sudo dnf install strace"
+        STRACE=0
+    else
+        # Reuse PID already confirmed by the verification step
+        RP_PID="$ROOTLESSPORT_PID"
+        STRACE_PROC="$TMPDIR_ROOT/strace_proc.py"
+
+        # Set default log path before the heredoc expands ${STRACE_LOG}
+        [[ -z "$STRACE_LOG" ]] && STRACE_LOG="$TMPDIR_ROOT/strace-gaps.log"
+
+        # Python processor: reads strace splice output line-by-line,
+        # tracks per-fd EAGAIN timestamps, prints gaps > GAP_MS immediately.
+        # Pre-filtering with grep --line-buffered keeps stdin volume low so
+        # the processor does not slow rootlessport down.
+        cat > "$STRACE_PROC" <<PYEOF
+#!/usr/bin/env python3
+"""
+Real-time strace EAGAIN gap processor.
+
+Reads strace -e trace=splice -T -tt output from stdin.
+For every source fd that shows EAGAIN followed by a successful splice,
+prints the gap — the time the goroutine spent parked in Go's scheduler
+(unpatched) or blocked in poll(2) waiting for data (patched).
+
+GAP_MS threshold: only gaps above this value are printed.
+Thread-hop detection: if the resume happens on a different OS thread
+(pid) than the EAGAIN, it is labelled — this is the signature of Go's
+M:N scheduler moving the goroutine to a different OS thread after the
+netpoller wakes it.
+"""
+import sys, re
+
+GAP_MS      = ${GAP_MS}
+EAGAIN_RE   = re.compile(r'\[pid\s+(\d+)\]\s+(\d+:\d+:\d+\.\d+)\s+splice\((\d+).*EAGAIN')
+RESUME_RE   = re.compile(r'\[pid\s+(\d+)\]\s+(\d+:\d+:\d+\.\d+)\s+splice\((\d+)[^=]+=\s+([1-9]\d*)')
+
+RED   = "\033[0;31m"
+YLW   = "\033[1;33m"
+GRN   = "\033[0;32m"
+NC    = "\033[0m"
+
+LOG_FILE = '${STRACE_LOG}'   # path to dedicated log file, or empty / "-" to disable
+
+def to_sec(ts):
+    h, m, rest = ts.split(':')
+    return int(h) * 3600 + int(m) * 60 + float(rest)
+
+# Open the strace log file if requested
+_logf = None
+if LOG_FILE and LOG_FILE != "-":
+    try:
+        _logf = open(LOG_FILE, "a", buffering=1)
+        _logf.write(f"# strace EAGAIN gap log — started {__import__('datetime').datetime.now()}\n")
+    except OSError as e:
+        print(f"WARNING: cannot open strace log {LOG_FILE}: {e}", file=sys.stderr)
+
+def emit(msg_color, msg_plain):
+    # Print coloured line to stdout and plain line to log file.
+    print(msg_color, flush=True)
+    if _logf:
+        _logf.write(msg_plain + "\n")
+
+eagain = {}   # fd -> (time_sec, ts_str, pid_str)
+
+for line in sys.stdin:
+    m = EAGAIN_RE.search(line)
+    if m:
+        pid, ts, fd = m.group(1), m.group(2), m.group(3)
+        eagain[fd] = (to_sec(ts), ts, pid)
+        continue
+
+    m = RESUME_RE.search(line)
+    if m:
+        pid, ts, fd = m.group(1), m.group(2), m.group(3)
+        if fd in eagain:
+            t0, ts0, pid0 = eagain.pop(fd)
+            gap_ms = (to_sec(ts) - t0) * 1000
+            if gap_ms >= GAP_MS:
+                hop_color = f"  {YLW}[thread-hop {pid0}→{pid}]{NC}" if pid != pid0 else ""
+                hop_plain = f"  [thread-hop {pid0}→{pid}]"          if pid != pid0 else ""
+                sev = RED if gap_ms >= 500 else YLW
+                emit(
+                    f"{sev}[STRACE {ts}]{NC} fd={fd:>4}  "
+                    f"EAGAIN→resume: {sev}{gap_ms:>8.0f} ms{NC}{hop_color}",
+                    f"[STRACE {ts}] fd={fd:>4}  EAGAIN→resume: {gap_ms:>8.0f} ms{hop_plain}"
+                )
+PYEOF
+
+        # Start strace piped to the processor — both run in background.
+        # grep pre-filters to only EAGAIN and successful splice lines,
+        # dramatically cutting the data volume the processor sees.
+        # Run strace pipeline in background; errors are non-fatal (wrapped to
+        # prevent set -e from aborting the script if strace exits early).
+        { strace -f -p "$RP_PID" -e trace=splice -T -tt 2>&1 | \
+            grep --line-buffered -E "EAGAIN|= [1-9]" | \
+            python3 "$STRACE_PROC"; } &
+        STRACE_PID=$!
+        ok "strace processor running (rootlessport PID $RP_PID, gap threshold ${GAP_MS} ms)"
+        info "  [STRACE] lines appear whenever EAGAIN→resume gap ≥ ${GAP_MS} ms"
+        info "  Strace gap log: $STRACE_LOG"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 step "Curl probe loop — direct backend latency"
 # ---------------------------------------------------------------------------
 DURATION_MSG="until Ctrl+C"
 [[ "$DURATION" -gt 0 ]] && DURATION_MSG="${DURATION}s"
 info "Probing http://localhost:${DIRECT_PORT}/ every ${PROBE_EVERY}s  ($DURATION_MSG)"
-info "SLOW threshold: 500 ms"
 echo ""
-printf "  ${YLW}%-8s  %-14s  %-14s  %-14s  %s${NC}\n" \
-    "Probe#" "DNS (ms)" "Connect (ms)" "Total (ms)" "Status"
-printf "  %-8s  %-14s  %-14s  %-14s  %s\n" \
-    "--------" "--------------" "--------------" "--------------" "--------"
+printf "  ${YLW}%-18s  %-12s  %-12s  %s${NC}\n" \
+    "Probe#  Time" "Connect ms" "Total ms" "Note"
+printf "  %-18s  %-12s  %-12s  %s\n" \
+    "------------------" "----------" "----------" "----"
 
 PROBE=0
 SLOW=0
@@ -417,38 +546,31 @@ while true; do
     PROBE=$((PROBE + 1))
 
     RESULT=$(curl -s -o /dev/null \
-        --max-time 60 \
-        -w "%{time_namelookup} %{time_connect} %{time_total} %{http_code}" \
-        "http://localhost:${DIRECT_PORT}/" 2>/dev/null) || RESULT="0 0 0 ERR"
+        -w "%{time_connect} %{time_total} %{http_code}" \
+        "http://localhost:${DIRECT_PORT}/" 2>/dev/null) || RESULT="0 0 ERR"
 
-    DNS_S=$(  awk '{print $1}' <<< "$RESULT")
-    CONN_S=$( awk '{print $2}' <<< "$RESULT")
-    TOTAL_S=$(awk '{print $3}' <<< "$RESULT")
-    CODE=$(   awk '{print $4}' <<< "$RESULT")
+    CONN_S=$( awk '{print $1}' <<< "$RESULT")
+    TOTAL_S=$(awk '{print $2}' <<< "$RESULT")
+    CODE=$(   awk '{print $3}' <<< "$RESULT")
 
-    DNS_MS=$(  awk "BEGIN {printf \"%.1f\", $DNS_S   * 1000}")
-    CONN_MS=$( awk "BEGIN {printf \"%.1f\", $CONN_S  * 1000}")
-    TOTAL_MS=$(awk "BEGIN {printf \"%.1f\", $TOTAL_S * 1000}")
-    IS_SLOW=$( awk "BEGIN {print ($TOTAL_MS > 500) ? 1 : 0}")
-
+    CONN_MS=$(  awk "BEGIN {printf \"%.1f\", $CONN_S  * 1000}")
+    TOTAL_MS=$( awk "BEGIN {printf \"%.1f\", $TOTAL_S * 1000}")
+    IS_SLOW=$(  awk "BEGIN {print ($TOTAL_MS > 500) ? 1 : 0}")
     TS=$(date +"%H:%M:%S")
 
     if [[ "$CODE" == "ERR" ]]; then
-        printf "  %-8s  %-14s  %-14s  %-14s  " \
-            "#${PROBE} ${TS}" "-" "-" "-"
+        printf "  %-18s  %-12s  %-12s  " "#${PROBE} ${TS}" "-" "-"
         echo -e "${RED}[ERROR]${NC}"
     elif [[ "$IS_SLOW" -eq 1 ]]; then
         SLOW=$((SLOW + 1))
-        printf "  %-8s  %-14s  %-14s  %-14s  " \
-            "#${PROBE} ${TS}" "${DNS_MS}ms" "${CONN_MS}ms" "${TOTAL_MS}ms"
-        echo -e "${RED}*** SLOW — EAGAIN scheduler lag ***${NC}"
+        printf "  %-18s  %-12s  %-12s  " \
+            "#${PROBE} ${TS}" "${CONN_MS}ms" "${TOTAL_MS}ms"
+        echo -e "${RED}[CURL] SLOW — HTTP-level delay visible${NC}"
     else
-        printf "  %-8s  %-14s  %-14s  %-14s  " \
-            "#${PROBE} ${TS}" "${DNS_MS}ms" "${CONN_MS}ms" "${TOTAL_MS}ms"
-        echo -e "${GRN}OK${NC}"
+        printf "  %-18s  %-12s  %-12s\n" \
+            "#${PROBE} ${TS}" "${CONN_MS}ms" "${TOTAL_MS}ms"
     fi
 
-    # Check duration limit
     if [[ "$DURATION" -gt 0 ]]; then
         NOW=$(date +%s)
         [[ $(( NOW - START )) -ge "$DURATION" ]] && break
@@ -458,12 +580,14 @@ while true; do
 done
 
 # ---------------------------------------------------------------------------
+[[ -n "$STRACE_PID" ]] && kill "$STRACE_PID" 2>/dev/null || true
+
 echo ""
 echo "========================================"
 echo "Summary"
 echo "========================================"
-echo "  Probes     : $PROBE"
-echo "  Slow >500ms: $SLOW"
+echo "  Probes          : $PROBE"
+echo "  CURL slow >500ms: $SLOW"
 [[ "$SLOW" -gt 0 ]] && \
-    echo -e "  ${RED}rootlessport EAGAIN scheduler lag confirmed.${NC}" || \
-    echo -e "  ${GRN}No spikes detected (patched binary or increase --conns).${NC}"
+    echo -e "  ${RED}HTTP-level EAGAIN lag confirmed via curl probe.${NC}" || \
+    echo -e "  ${GRN}No curl-level spikes — check [STRACE] lines above for kernel evidence.${NC}"
