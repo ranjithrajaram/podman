@@ -1,0 +1,469 @@
+#!/bin/bash
+# rootlessport-sustained-reproducer.sh
+#
+# Low-CPU, long-running variant of the rootlessport EAGAIN reproducer.
+#
+# Problem with the high-throughput reproducer:
+#   The Python load generator runs in a tight loop, consuming 40-50% CPU.
+#   That makes it impractical as a long-running background process.
+#
+# Key insight — goroutines are cheap to keep alive:
+#   Each TCP connection through rootlessport holds two goroutines (splice
+#   in + splice out) blocked in poll(2)/waitForFd, consuming no CPU.
+#   We do NOT need a high request rate to create goroutine-pool pressure;
+#   we need many CONNECTIONS OPEN simultaneously.
+#
+#   Strategy:
+#     1. Maintain N persistent connections to Envoy (goroutines alive, idle).
+#     2. Every BURST_INTERVAL seconds, fire a request on ALL of them at once
+#        (synchronized burst).  All N goroutine-pairs wake simultaneously,
+#        competing for Go's scheduler — this is where EAGAIN lag appears.
+#     3. Foreground curl loop probes the direct backend at a human-readable
+#        pace and prints each response time.
+#
+# Pod layout:
+#   host:ENVOY_PORT  ──► rootlessport ──► envoy:8080 ──► python-app:8081
+#   (sustained background, low CPU)      [pod-local after Envoy, no rootlessport]
+#
+#   host:DIRECT_PORT ──► rootlessport ──► python-app:8081
+#   (curl probe — latency observed here)
+#
+# Usage:
+#   bash rootlessport-sustained-reproducer.sh [OPTIONS]
+#
+# Options:
+#   --envoy-port   N   Host port → Envoy (default: 18080)
+#   --direct-port  N   Host port → Python app direct (default: 18081)
+#   --conns        N   Persistent connections to Envoy (default: 48)
+#   --rate         N   Max requests per second per connection (default: 5)
+#                      Total Envoy req/s = conns × rate.  Controls CPU:
+#                        --rate 2  → low    (~10% CPU, may not trigger bug)
+#                        --rate 5  → medium (~20% CPU, recommended)
+#                        --rate 10 → high   (~35% CPU, reliably triggers bug)
+#                        --rate 0  → unlimited tight loop (original behaviour)
+#   --probe-every  S   Seconds between curl probes (default: 3)
+#   --body-size    B   Response bytes per request (default: 131072 = 128 KB)
+#   --duration     S   Total run time in seconds, 0 = run until Ctrl+C (default: 0)
+#   --no-cleanup       Leave pod running after exit
+#
+# Requirements: rootless podman, python3, curl
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+ENVOY_PORT=18080
+DIRECT_PORT=18081
+CONNS=48            # persistent connections to Envoy — goroutine pressure source
+RATE=5              # max req/s per connection (0 = unlimited)
+PROBE_EVERY=3       # curl probe interval in seconds
+BODY_SIZE=131072    # 128 KB — two splice pipe fills per response
+DURATION=0          # 0 = run until Ctrl+C
+NO_CLEANUP=0
+
+POD_NAME="eagain-sustained-pod"
+NETWORK_NAME="eagain-sustained-net"
+ENVOY_IMAGE="docker.io/envoyproxy/envoy:v1.29-latest"
+PYTHON_IMAGE="docker.io/library/python:3.11-slim"
+
+TMPDIR_ROOT="$(mktemp -d /tmp/eagain-sustained.XXXXXX)"
+
+RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; BLU='\033[0;34m'; NC='\033[0m'
+step()  { echo -e "\n${YLW}=== $* ===${NC}"; }
+ok()    { echo -e "${GRN}[OK]${NC}  $*"; }
+err()   { echo -e "${RED}[ERR]${NC} $*"; }
+info()  { echo -e "${BLU}[INFO]${NC} $*"; }
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --envoy-port)  ENVOY_PORT="$2";  shift 2 ;;
+        --direct-port) DIRECT_PORT="$2"; shift 2 ;;
+        --conns)       CONNS="$2";       shift 2 ;;
+        --rate)        RATE="$2";        shift 2 ;;
+        --probe-every) PROBE_EVERY="$2"; shift 2 ;;
+        --body-size)   BODY_SIZE="$2";   shift 2 ;;
+        --duration)    DURATION="$2";    shift 2 ;;
+        --no-cleanup)  NO_CLEANUP=1;     shift   ;;
+        *) err "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+BG_PID=""
+cleanup() {
+    [[ -n "$BG_PID" ]] && kill "$BG_PID" 2>/dev/null || true
+    if [[ "$NO_CLEANUP" -eq 1 ]]; then
+        info "Skipping cleanup (--no-cleanup).  Pod: $POD_NAME"
+        return
+    fi
+    step "Cleanup"
+    podman pod stop  "$POD_NAME"    2>/dev/null || true
+    podman pod rm -f "$POD_NAME"    2>/dev/null || true
+    podman network rm "$NETWORK_NAME" 2>/dev/null || true
+    rm -rf "$TMPDIR_ROOT"
+    ok "Done"
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+step "Prerequisites"
+# ---------------------------------------------------------------------------
+for cmd in podman python3 curl awk; do
+    command -v "$cmd" &>/dev/null || { err "$cmd not found"; exit 1; }
+done
+info "Running as: $(id)"
+info "Podman:     $(podman --version)"
+
+# ---------------------------------------------------------------------------
+step "Cleanup any previous run"
+# ---------------------------------------------------------------------------
+podman pod stop  "$POD_NAME"    2>/dev/null || true
+podman pod rm -f "$POD_NAME"    2>/dev/null || true
+podman network rm "$NETWORK_NAME" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+step "Create bridge network (required for rootlessport)"
+# ---------------------------------------------------------------------------
+podman network create --driver bridge "$NETWORK_NAME"
+ok "Network: $NETWORK_NAME"
+
+# ---------------------------------------------------------------------------
+step "Create pod"
+# ---------------------------------------------------------------------------
+podman pod create \
+    --name    "$POD_NAME" \
+    --network "$NETWORK_NAME" \
+    --publish "${ENVOY_PORT}:8080" \
+    --publish "${DIRECT_PORT}:8081"
+ok "Pod created"
+
+# ---------------------------------------------------------------------------
+step "Verify rootlessport is running"
+# ---------------------------------------------------------------------------
+ROOTLESSPORT_PID=""
+for i in $(seq 1 10); do
+    ROOTLESSPORT_PID=$(pgrep -f "rootlessport" 2>/dev/null | head -1 || true)
+    [[ -n "$ROOTLESSPORT_PID" ]] && break
+    sleep 1
+done
+if [[ -n "$ROOTLESSPORT_PID" ]]; then
+    ROOTLESSPORT_EXE=$(readlink -f "/proc/${ROOTLESSPORT_PID}/exe" 2>/dev/null || echo "unknown")
+    ok "rootlessport PID $ROOTLESSPORT_PID  ($ROOTLESSPORT_EXE)"
+else
+    err "rootlessport not found — check 'podman info | grep networkBackend'"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+step "Write Envoy config"
+# ---------------------------------------------------------------------------
+ENVOY_CFG_DIR="$TMPDIR_ROOT/envoy"
+mkdir -p "$ENVOY_CFG_DIR"
+cat > "$ENVOY_CFG_DIR/envoy.yaml" <<'ENVOY_EOF'
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 8080 }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: backend
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route:
+                  cluster: python_app
+                  timeout: 0s
+
+  clusters:
+  - name: python_app
+    connect_timeout: 0.5s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    max_requests_per_connection: 1
+    load_assignment:
+      cluster_name: python_app
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: 8081 }
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+ENVOY_EOF
+
+# ---------------------------------------------------------------------------
+step "Start Envoy container"
+# ---------------------------------------------------------------------------
+podman run -d \
+    --name envoy-proxy \
+    --pod  "$POD_NAME" \
+    --volume "$ENVOY_CFG_DIR:/etc/envoy:ro,z" \
+    --entrypoint /usr/local/bin/envoy \
+    "$ENVOY_IMAGE" \
+    -c /etc/envoy/envoy.yaml --log-level warning
+ok "Envoy started"
+
+# ---------------------------------------------------------------------------
+step "Write Python app"
+# ---------------------------------------------------------------------------
+APP_DIR="$TMPDIR_ROOT/app"
+mkdir -p "$APP_DIR"
+cat > "$APP_DIR/server.py" <<PYEOF
+#!/usr/bin/env python3
+import os, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BODY_SIZE = int(os.environ.get("BODY_SIZE", "${BODY_SIZE}"))
+BODY      = b"A" * BODY_SIZE
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(BODY_SIZE))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(BODY)
+    def log_message(self, fmt, *args):
+        pass
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(("0.0.0.0", 8081), Handler)
+    print(f"Python app: {BODY_SIZE} B/response on :8081", flush=True)
+    server.serve_forever()
+PYEOF
+
+podman run -d \
+    --name python-app \
+    --pod  "$POD_NAME" \
+    --volume "$APP_DIR:/app:ro,z" \
+    --env   "BODY_SIZE=${BODY_SIZE}" \
+    "$PYTHON_IMAGE" \
+    python3 /app/server.py
+ok "Python app started"
+
+# ---------------------------------------------------------------------------
+step "Wait for readiness (up to 90 s)"
+# ---------------------------------------------------------------------------
+READY_ENVOY=0; READY_DIRECT=0
+for i in $(seq 1 90); do
+    [[ "$READY_ENVOY"  -eq 0 ]] && curl -sf --max-time 2 "http://localhost:${ENVOY_PORT}/"  -o /dev/null 2>/dev/null && READY_ENVOY=1  && ok "Envoy ready"
+    [[ "$READY_DIRECT" -eq 0 ]] && curl -sf --max-time 2 "http://localhost:${DIRECT_PORT}/" -o /dev/null 2>/dev/null && READY_DIRECT=1 && ok "Backend direct ready"
+    [[ "$READY_ENVOY" -eq 1 && "$READY_DIRECT" -eq 1 ]] && break
+    sleep 1
+    [[ $(( i % 15 )) -eq 0 ]] && info "  still waiting... ($i s)"
+done
+[[ "$READY_ENVOY" -eq 0 || "$READY_DIRECT" -eq 0 ]] && { err "Services not ready"; exit 1; }
+
+# ---------------------------------------------------------------------------
+step "Write low-CPU background load generator"
+# ---------------------------------------------------------------------------
+# Design: CONNS persistent connections, idle between bursts.
+#
+# Goroutine lifecycle in rootlessport:
+#   connection opens  → 2 goroutines spawned (splice in + splice out)
+#   connection idle   → goroutines blocked in poll()/waitForFd — ZERO CPU
+#   burst fires       → all goroutines wake simultaneously → scheduler contention
+#   connection closes → goroutines exit
+#
+# By keeping connections alive but sending infrequently we hold the goroutine
+# pool at CONNS×2 without burning CPU between bursts.
+BG_SCRIPT="$TMPDIR_ROOT/bg_load.py"
+cat > "$BG_SCRIPT" <<PYEOF
+#!/usr/bin/env python3
+"""
+Rate-limited continuous load generator for rootlessport EAGAIN reproducer.
+
+Why continuous instead of bursts:
+  Scheduler pressure = goroutines in the RUNNABLE state competing for CPUs.
+  Goroutines blocked in poll() are NOT in the run queue — they consume zero
+  CPU and create zero scheduler pressure.  A burst approach has a 10% duty
+  cycle; between bursts rootlessport's scheduler is idle and the curl probe
+  sees no delay.
+
+Why rate-limited instead of tight loop:
+  A tight loop saturates the CPU of the load generator itself, leaving fewer
+  cores for rootlessport to run its goroutines.  Rate limiting spreads the
+  same goroutine pressure over time at lower CPU cost.
+
+Mechanism:
+  Each worker maintains one persistent HTTP/1.1 connection to Envoy.
+  After each response it sleeps for (1/RATE - elapsed) seconds.
+  Total Envoy req/s = CONNS * RATE.
+  rootlessport holds CONNS*2 goroutines continuously transitioning between
+  the run queue and poll, creating sustained scheduler pressure.
+"""
+import http.client, threading, time, os
+
+HOST       = "localhost"
+ENVOY_PORT = ${ENVOY_PORT}
+CONNS      = ${CONNS}
+RATE       = ${RATE}          # max req/s per connection (0 = unlimited)
+MIN_SLEEP  = 1.0 / RATE if RATE > 0 else 0   # seconds per request minimum
+
+done = threading.Event()
+total_req  = 0
+total_err  = 0
+lock       = threading.Lock()
+
+def worker(wid):
+    global total_req, total_err
+    while not done.is_set():
+        try:
+            conn = http.client.HTTPConnection(HOST, ENVOY_PORT, timeout=30)
+            while not done.is_set():
+                t0 = time.monotonic()
+                conn.request("GET", "/")
+                resp = conn.getresponse()
+                resp.read()
+                elapsed = time.monotonic() - t0
+                with lock:
+                    total_req += 1
+                # Rate limiting: sleep the remainder of the per-request budget.
+                # This keeps CPU proportional to RATE while goroutines in
+                # rootlessport remain continuously active.
+                if MIN_SLEEP > 0:
+                    leftover = MIN_SLEEP - elapsed
+                    if leftover > 0:
+                        time.sleep(leftover)
+        except Exception:
+            with lock:
+                total_err += 1
+            time.sleep(0.5)
+
+def reporter():
+    """Print a periodic throughput line so the user can see load is running."""
+    prev = 0
+    while not done.is_set():
+        time.sleep(10)
+        with lock:
+            cur = total_req
+        rate = (cur - prev) / 10
+        prev = cur
+        print(f"[bg] {rate:.0f} req/s to Envoy:{ENVOY_PORT}  "
+              f"total={cur}  errors={total_err}", flush=True)
+
+threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+           for i in range(CONNS)]
+for t in threads:
+    t.start()
+
+threading.Thread(target=reporter, daemon=True).start()
+
+rate_str = f"{RATE} req/s/conn ({CONNS * RATE} req/s total)" if RATE > 0 else "unlimited"
+print(f"[bg] {CONNS} connections → Envoy:{ENVOY_PORT}  rate={rate_str}  "
+      f"(pid={os.getpid()})", flush=True)
+
+try:
+    while True:
+        time.sleep(60)
+except (KeyboardInterrupt, EOFError):
+    pass
+finally:
+    done.set()
+PYEOF
+
+# ---------------------------------------------------------------------------
+step "Start background load (low CPU)"
+# ---------------------------------------------------------------------------
+python3 "$BG_SCRIPT" &
+BG_PID=$!
+info "Background load PID: $BG_PID"
+info "  $CONNS connections × ${RATE} req/s = $((CONNS * RATE)) req/s to Envoy"
+info "  Goroutines in rootlessport: ~$((CONNS * 2)) continuously active"
+info "  Expected CPU from load generator: ~$(( CONNS * RATE / 10 ))–$(( CONNS * RATE / 5 ))%"
+
+# Give connections time to open and prime
+sleep 5
+
+# ---------------------------------------------------------------------------
+step "Curl probe loop — direct backend latency"
+# ---------------------------------------------------------------------------
+DURATION_MSG="until Ctrl+C"
+[[ "$DURATION" -gt 0 ]] && DURATION_MSG="${DURATION}s"
+info "Probing http://localhost:${DIRECT_PORT}/ every ${PROBE_EVERY}s  ($DURATION_MSG)"
+info "SLOW threshold: 500 ms"
+echo ""
+printf "  ${YLW}%-8s  %-14s  %-14s  %-14s  %s${NC}\n" \
+    "Probe#" "DNS (ms)" "Connect (ms)" "Total (ms)" "Status"
+printf "  %-8s  %-14s  %-14s  %-14s  %s\n" \
+    "--------" "--------------" "--------------" "--------------" "--------"
+
+PROBE=0
+SLOW=0
+START=$(date +%s)
+
+while true; do
+    PROBE=$((PROBE + 1))
+
+    RESULT=$(curl -s -o /dev/null \
+        --max-time 60 \
+        -w "%{time_namelookup} %{time_connect} %{time_total} %{http_code}" \
+        "http://localhost:${DIRECT_PORT}/" 2>/dev/null) || RESULT="0 0 0 ERR"
+
+    DNS_S=$(  awk '{print $1}' <<< "$RESULT")
+    CONN_S=$( awk '{print $2}' <<< "$RESULT")
+    TOTAL_S=$(awk '{print $3}' <<< "$RESULT")
+    CODE=$(   awk '{print $4}' <<< "$RESULT")
+
+    DNS_MS=$(  awk "BEGIN {printf \"%.1f\", $DNS_S   * 1000}")
+    CONN_MS=$( awk "BEGIN {printf \"%.1f\", $CONN_S  * 1000}")
+    TOTAL_MS=$(awk "BEGIN {printf \"%.1f\", $TOTAL_S * 1000}")
+    IS_SLOW=$( awk "BEGIN {print ($TOTAL_MS > 500) ? 1 : 0}")
+
+    TS=$(date +"%H:%M:%S")
+
+    if [[ "$CODE" == "ERR" ]]; then
+        printf "  %-8s  %-14s  %-14s  %-14s  " \
+            "#${PROBE} ${TS}" "-" "-" "-"
+        echo -e "${RED}[ERROR]${NC}"
+    elif [[ "$IS_SLOW" -eq 1 ]]; then
+        SLOW=$((SLOW + 1))
+        printf "  %-8s  %-14s  %-14s  %-14s  " \
+            "#${PROBE} ${TS}" "${DNS_MS}ms" "${CONN_MS}ms" "${TOTAL_MS}ms"
+        echo -e "${RED}*** SLOW — EAGAIN scheduler lag ***${NC}"
+    else
+        printf "  %-8s  %-14s  %-14s  %-14s  " \
+            "#${PROBE} ${TS}" "${DNS_MS}ms" "${CONN_MS}ms" "${TOTAL_MS}ms"
+        echo -e "${GRN}OK${NC}"
+    fi
+
+    # Check duration limit
+    if [[ "$DURATION" -gt 0 ]]; then
+        NOW=$(date +%s)
+        [[ $(( NOW - START )) -ge "$DURATION" ]] && break
+    fi
+
+    sleep "$PROBE_EVERY"
+done
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "========================================"
+echo "Summary"
+echo "========================================"
+echo "  Probes     : $PROBE"
+echo "  Slow >500ms: $SLOW"
+[[ "$SLOW" -gt 0 ]] && \
+    echo -e "  ${RED}rootlessport EAGAIN scheduler lag confirmed.${NC}" || \
+    echo -e "  ${GRN}No spikes detected (patched binary or increase --conns).${NC}"
