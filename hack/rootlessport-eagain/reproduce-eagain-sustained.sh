@@ -65,7 +65,8 @@ DIRECT_PORT=18081
 CONNS=48            # persistent connections to Envoy — goroutine pressure source
 RATE=5              # max req/s per connection (0 = unlimited)
 PROBE_EVERY=3       # curl probe interval in seconds
-BODY_SIZE=131072    # 128 KB — two splice pipe fills per response
+BODY_SIZE=1048576   # 1 MB — 32 EAGAIN events per response with 32 KB Envoy buffer
+                    # (matches production: per_connection_buffer_limit_bytes=32768)
 DURATION=0          # 0 = run until Ctrl+C
 STRACE=0            # attach strace to rootlessport and print EAGAIN gaps
 GAP_MS=100          # minimum EAGAIN→resume gap in ms to print
@@ -170,6 +171,14 @@ static_resources:
   - name: listener_0
     address:
       socket_address: { address: 0.0.0.0, port_value: 8080 }
+    # 32 KB downstream buffer — matches the problematic production configuration.
+    # Envoy writes at most 32 KB to the downstream socket before pausing to
+    # refill from upstream.  Because the splice pipe is 64 KB, rootlessport
+    # hits EAGAIN on *every* 32 KB chunk: the pipe is never fully filled in
+    # one shot.  Each EAGAIN parks a goroutine in Go's netpoller.  Under
+    # concurrent load the parked goroutines pile up and the scheduler wakeup
+    # latency becomes the dominant source of connection delay.
+    per_connection_buffer_limit_bytes: 32768
     filter_chains:
     - filters:
       - name: envoy.filters.network.http_connection_manager
@@ -487,27 +496,43 @@ def emit(msg_color, msg_plain):
 
 eagain = {}   # fd -> (time_sec, ts_str, pid_str)
 
+# Track EAGAIN by (srcFd, dstFd) pair — the fill direction is splice(srcFd → dstFd=pipeWrite).
+# Matching on both fds avoids false positives where the drain goroutine
+# (splice pipe→dstFd) on the same srcFd is mistaken for a resume of the
+# fill goroutine.  Pattern: splice(A, NULL, B, NULL, ...) EAGAIN means
+# the *fill* of pipe B from source A was blocked.
+EAGAIN_PAIR_RE = re.compile(
+    r'\[pid\s+(\d+)\]\s+(\d+:\d+:\d+\.\d+)\s+splice\((\d+), NULL, (\d+), NULL.*EAGAIN')
+RESUME_PAIR_RE = re.compile(
+    r'\[pid\s+(\d+)\]\s+(\d+:\d+:\d+\.\d+)\s+splice\((\d+), NULL, (\d+), NULL[^=]+=\s+([1-9]\d*)')
+
+# eagain keyed by (srcFd, dstFd) pair to match direction
+eagain_pair = {}
+
 for line in sys.stdin:
-    m = EAGAIN_RE.search(line)
+    m = EAGAIN_PAIR_RE.search(line)
     if m:
-        pid, ts, fd = m.group(1), m.group(2), m.group(3)
-        eagain[fd] = (to_sec(ts), ts, pid)
+        pid, ts, src, dst = m.group(1), m.group(2), m.group(3), m.group(4)
+        key = (src, dst)
+        eagain_pair[key] = (to_sec(ts), ts, pid)
         continue
 
-    m = RESUME_RE.search(line)
+    m = RESUME_PAIR_RE.search(line)
     if m:
-        pid, ts, fd = m.group(1), m.group(2), m.group(3)
-        if fd in eagain:
-            t0, ts0, pid0 = eagain.pop(fd)
+        pid, ts, src, dst = m.group(1), m.group(2), m.group(3), m.group(4)
+        key = (src, dst)
+        if key in eagain_pair:
+            t0, ts0, pid0 = eagain_pair.pop(key)
             gap_ms = (to_sec(ts) - t0) * 1000
             if gap_ms >= GAP_MS:
+                # Thread-hop on the SAME direction = genuine Go scheduler rescheduling
                 hop_color = f"  {YLW}[thread-hop {pid0}→{pid}]{NC}" if pid != pid0 else ""
                 hop_plain = f"  [thread-hop {pid0}→{pid}]"          if pid != pid0 else ""
                 sev = RED if gap_ms >= 500 else YLW
                 emit(
-                    f"{sev}[STRACE {ts}]{NC} fd={fd:>4}  "
+                    f"{sev}[STRACE {ts}]{NC} fd={src:>4}→{dst}  "
                     f"EAGAIN→resume: {sev}{gap_ms:>8.0f} ms{NC}{hop_color}",
-                    f"[STRACE {ts}] fd={fd:>4}  EAGAIN→resume: {gap_ms:>8.0f} ms{hop_plain}"
+                    f"[STRACE {ts}] fd={src:>4}→{dst}  EAGAIN→resume: {gap_ms:>8.0f} ms{hop_plain}"
                 )
 PYEOF
 
