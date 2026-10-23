@@ -1,0 +1,157 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * RootlessPort EAGAIN Race Detector
+ *
+ * Traces the exact sequence that causes 5-20 second delays:
+ * 1. recvmsg() receives data from network
+ * 2. splice() returns EAGAIN (pipe not ready)
+ * 3. Go runtime blocks goroutine in poller
+ * 4. Scheduler latency (5-20 seconds)
+ * 5. Goroutine resumes, retries splice()
+ *
+ * Usage:
+ *   sudo bpftrace rootlessport_eagain_race.bt <rootlessport_parent_pid> <rootlessport_child_pid> <java_pid>
+ *
+ * Look for: RECV followed by SPLICE_EAGAIN followed by long gap before SPLICE_SUCCESS
+ */
+
+BEGIN
+{
+    printf("Tracing rootlessport EAGAIN race...\n");
+    printf("Parent PID: %d, Child PID: %d, Java PID: %d\n", $1, $2, $3);
+    printf("Looking for: RECV → SPLICE_EAGAIN → [long delay] → SPLICE_RETRY\n");
+    printf("Timestamp format: nanoseconds since boot\n\n");
+}
+
+// Java sends data (baseline timestamp)
+kprobe:tcp_sendmsg
+/ pid == $3 /
+{
+    @java_send[tid] = nsecs;
+    printf("%llu JAVA_SEND tid=%d\n", nsecs, tid);
+}
+
+// Rootlessport receives data
+tracepoint:syscalls:sys_exit_recvmsg
+/ pid == $1 || pid == $2 /
+{
+    if (args->ret > 0) {
+        @recv[tid] = nsecs;
+        printf("%llu RECV pid=%d tid=%d bytes=%d\n",
+               nsecs, pid, tid, args->ret);
+    }
+}
+
+// Also track read() for completeness
+tracepoint:syscalls:sys_exit_read
+/ (pid == $1 || pid == $2) && args->ret > 0 /
+{
+    @recv[tid] = nsecs;
+    printf("%llu READ pid=%d tid=%d bytes=%d\n",
+           nsecs, pid, tid, args->ret);
+}
+
+// Splice SUCCESS
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret > 0 /
+{
+    $tid = tid;
+    $recv_ts = @recv[$tid];
+
+    if ($recv_ts > 0) {
+        $delay_us = (nsecs - $recv_ts) / 1000;
+        printf("%llu SPLICE_SUCCESS pid=%d tid=%d bytes=%d delay_us=%llu\n",
+               nsecs, pid, $tid, args->ret, $delay_us);
+
+        if ($delay_us > 1000000) {
+            printf(">>> ALERT: RECV→SPLICE delay %llu ms (SCHEDULER LATENCY!) <<<\n", $delay_us / 1000);
+        }
+        delete(@recv[$tid]);
+    } else {
+        printf("%llu SPLICE_SUCCESS pid=%d tid=%d bytes=%d\n",
+               nsecs, pid, $tid, args->ret);
+    }
+}
+
+// Splice EAGAIN - THE KEY EVENT
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret == -11 /
+{
+    $tid = tid;
+    @eagain[$tid] = nsecs;
+    @eagain_count[$tid]++;
+
+    printf("%llu SPLICE_EAGAIN pid=%d tid=%d count=%llu\n",
+           nsecs, pid, $tid, @eagain_count[$tid]);
+
+    // If we have a recent recv, calculate RECV→EAGAIN time
+    if (@recv[$tid] > 0) {
+        $delay_us = (nsecs - @recv[$tid]) / 1000;
+        printf("    RECV→EAGAIN delay: %llu us\n", $delay_us);
+    }
+}
+
+// Splice other errors
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret < 0 && args->ret != -11 /
+{
+    printf("%llu SPLICE_ERROR pid=%d tid=%d errno=%d\n",
+           nsecs, pid, tid, -args->ret);
+}
+
+// Track when goroutine wakes up after EAGAIN
+tracepoint:sched:sched_wakeup
+{
+    @wake[(uint64)args->pid] = nsecs;
+}
+
+// Track when goroutine actually runs
+tracepoint:sched:sched_switch
+{
+    $next_tid = (uint64)args->next_pid;
+
+    // Check if this TID had a recent EAGAIN
+    if (@eagain[$next_tid] > 0 && @wake[$next_tid] > 0) {
+        $wake_latency_us = (nsecs - @wake[$next_tid]) / 1000;
+        $eagain_latency_us = (nsecs - @eagain[$next_tid]) / 1000;
+
+        if ($wake_latency_us > 1000) {
+            printf("%llu SCHED_RESUME tid=%d wake_latency_us=%llu total_since_eagain_us=%llu\n",
+                   nsecs, $next_tid, $wake_latency_us, $eagain_latency_us);
+
+            if ($eagain_latency_us > 1000000) {
+                printf(">>> ALERT: Goroutine blocked %llu ms after EAGAIN! <<<\n", $eagain_latency_us / 1000);
+            }
+        }
+
+        delete(@eagain[$next_tid]);
+        delete(@wake[$next_tid]);
+    }
+}
+
+// Runtime poller events (commented out - need correct rootlesskit binary path)
+// uprobe:/path/to/rootlesskit:runtime.netpollblock
+// / pid == $1 || pid == $2 /
+// {
+//     printf("%llu NETPOLL_BLOCK pid=%d tid=%d\n", nsecs, pid, tid);
+// }
+//
+// uprobe:/path/to/rootlesskit:runtime.netpollunblock
+// / pid == $1 || pid == $2 /
+// {
+//     printf("%llu NETPOLL_UNBLOCK pid=%d tid=%d\n", nsecs, pid, tid);
+// }
+
+END
+{
+    printf("\n=== Summary ===\n");
+    printf("EAGAIN occurrences by TID:\n");
+    print(@eagain_count);
+
+    clear(@recv);
+    clear(@eagain);
+    clear(@eagain_count);
+    clear(@wake);
+    clear(@java_send);
+}
