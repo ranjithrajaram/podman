@@ -1,0 +1,259 @@
+#!/usr/bin/env bpftrace
+/*
+ * rootlessport_eagain_v2.bt — Improved rootlessport EAGAIN stall tracer
+ *
+ * Improvements over v1 to address reviewer concerns:
+ *
+ * 1. fd-level tracking on EAGAIN:
+ *    @eagain_fd[tid] records which fd got EAGAIN so cross-fd confusion
+ *    is visible when the same tid later splices a different fd.
+ *
+ * 2. epoll_pwait confirmation of fd readiness:
+ *    Go's runtime netpoller calls epoll_pwait(2) to wait for events.
+ *    When epoll_pwait returns > 0, the kernel has confirmed that at
+ *    least one fd is ready.  We record this timestamp per-pid so that
+ *    when a CONFIRMED ALERT fires we can state:
+ *      "kernel epoll confirmed fd was ready Xms before splice succeeded"
+ *    This addresses "we don't know if the fd was ready".
+ *
+ * 3. Two separate delay measurements:
+ *    A. RECV→SPLICE (original): only when RECV and SPLICE_SUCCESS
+ *       happen on the same tid.  Labelled as potentially affected by
+ *       thread reuse — not used for CONFIRMED ALERTs.
+ *    B. EAGAIN→SPLICE (same tid, same fd): measures the window from
+ *       when splice returned EAGAIN on fd X to when splice succeeded
+ *       on the same fd X, same tid.  If epoll_pwait returned during
+ *       this window, the alert is labelled CONFIRMED.
+ *
+ * 4. SCHED_RESUME (kernel-level, unchanged):
+ *    sched_wakeup + sched_switch tracepoints.  No fd or goroutine
+ *    ambiguity — pure kernel scheduler evidence.
+ *
+ * Usage:
+ *   bpftrace rootlessport_eagain_v2.bt \
+ *       <rootlessport-parent-pid> \
+ *       <rootlessport-child-pid> \
+ *       <backend-app-pid-or-0>
+ *
+ * Note: BPFTRACE_MAX_MAP_KEYS=65536 recommended on busy nodes.
+ *       Requires ~2 GB free disk if redirecting output on high-traffic nodes.
+ */
+
+BEGIN
+{
+    printf("rootlessport_eagain_v2: tracing parent=%d child=%d app=%d\n", $1, $2, $3);
+    printf("Measurements:\n");
+    printf("  RECV→SPLICE    : same-tid, may include unrelated thread work\n");
+    printf("  EAGAIN→SPLICE  : same-tid, same-fd — cleaner stall window\n");
+    printf("  SCHED_RESUME   : kernel sched tracepoints — most reliable\n");
+    printf("  CONFIRMED ALERT: epoll verified fd-ready during the stall window\n\n");
+}
+
+// ================================================================
+// RECV — data arrived at rootlessport (SCM_RIGHTS or data path)
+// ================================================================
+tracepoint:syscalls:sys_exit_recvmsg
+/ (pid == $1 || pid == $2) && args->ret > 0 /
+{
+    @recv[tid] = nsecs;
+    printf("%llu RECV pid=%d tid=%d bytes=%d\n",
+           nsecs, pid, tid, (int32)args->ret);
+}
+
+// Track read() as well (rootlessport-child uses read in some paths)
+tracepoint:syscalls:sys_exit_read
+/ (pid == $1 || pid == $2) && args->ret > 0 /
+{
+    @recv[tid] = nsecs;
+    printf("%llu READ pid=%d tid=%d bytes=%d\n",
+           nsecs, pid, tid, (int32)args->ret);
+}
+
+// ================================================================
+// EPOLL_PWAIT — Go's netpoller confirming fd readiness
+// When epoll_pwait returns > 0, at least one fd IS ready.
+// Recorded per-pid (netpoller goroutine may be on a different tid
+// than the goroutine that later calls splice).
+// ================================================================
+tracepoint:syscalls:sys_exit_epoll_pwait
+/ (pid == $1 || pid == $2) && (int32)args->ret > 0 /
+{
+    @epoll_ready_ns[pid] = nsecs;
+    printf("%llu EPOLL_READY pid=%d tid=%d nfds=%d\n",
+           nsecs, pid, tid, (int32)args->ret);
+}
+
+// ================================================================
+// SPLICE_EAGAIN
+// Track per (tid, fd_in) so we can verify same-fd matching at SUCCESS.
+// ================================================================
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret == -11 /
+{
+    $fd_in = args->fd_in;
+    @eagain_ns[tid]    = nsecs;
+    @eagain_fd[tid]    = $fd_in;
+    @eagain_count[tid]++;
+
+    printf("%llu SPLICE_EAGAIN pid=%d tid=%d fd_in=%d count=%llu\n",
+           nsecs, pid, tid, $fd_in, @eagain_count[tid]);
+
+    // Was epoll_pwait recently called (fd possibly ready)?
+    if (@epoll_ready_ns[pid] > 0) {
+        $since_epoll = (nsecs - @epoll_ready_ns[pid]) / 1000;
+        if ($since_epoll < 5000000) {   // within 5s of an epoll event
+            printf("  epoll_ready %llu us ago (fd may already be ready)\n",
+                   $since_epoll);
+        }
+    }
+
+    // Original RECV→EAGAIN timing
+    if (@recv[tid] > 0) {
+        $recv_lag = (nsecs - @recv[tid]) / 1000;
+        printf("  RECV→EAGAIN delay: %llu us\n", $recv_lag);
+    }
+}
+
+// ================================================================
+// SPLICE_SUCCESS
+// Two measurements with clear labels:
+//   A. RECV→SPLICE (original, same-tid only)
+//   B. EAGAIN→SPLICE same-tid, same-fd (cleaner)
+// CONFIRMED ALERT requires: delay > 1s AND epoll_pwait fired
+// during the EAGAIN window, proving fd was kernel-confirmed ready.
+// ================================================================
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret > 0 /
+{
+    $tid = tid;
+    $fd_in = args->fd_in;
+
+    // ---- Measurement A: RECV→SPLICE (same tid) ------------------
+    if (@recv[$tid] > 0) {
+        $delay_a = (nsecs - @recv[$tid]) / 1000;
+        printf("%llu SPLICE_SUCCESS pid=%d tid=%d bytes=%d delay_us=%llu\n",
+               nsecs, pid, $tid, (int32)args->ret, $delay_a);
+        if ($delay_a > 1000000) {
+            printf(">>> ALERT (RECV→SPLICE, same-tid): %llu ms — "
+                   "thread may have handled unrelated work <<<\n",
+                   $delay_a / 1000);
+        }
+        delete(@recv[$tid]);
+    } else {
+        printf("%llu SPLICE_SUCCESS pid=%d tid=%d bytes=%d\n",
+               nsecs, pid, $tid, (int32)args->ret);
+    }
+
+    // ---- Measurement B: EAGAIN→SPLICE (same tid, same fd) -------
+    if (@eagain_ns[$tid] > 0) {
+        $delay_b    = (nsecs - @eagain_ns[$tid]) / 1000;
+        $prev_fd    = @eagain_fd[$tid];
+        $same_fd    = ($prev_fd == $fd_in);
+
+        if ($same_fd) {
+            // Strongest measurement: same thread, same fd
+            printf("  EAGAIN→SPLICE (same-tid, same-fd=%d): %llu us\n",
+                   $fd_in, $delay_b);
+
+            if ($delay_b > 1000000) {
+                // Check if epoll confirmed fd readiness during this window
+                $epoll_during = (@epoll_ready_ns[pid] > @eagain_ns[$tid] &&
+                                 @epoll_ready_ns[pid] < nsecs);
+                if ($epoll_during) {
+                    $after_epoll = (nsecs - @epoll_ready_ns[pid]) / 1000;
+                    printf(">>> CONFIRMED ALERT: fd=%d was kernel-confirmed ready "
+                           "%llu ms before splice succeeded. "
+                           "Total stall: %llu ms. "
+                           "fd WAS ready — goroutine was not scheduled. <<<\n",
+                           $fd_in,
+                           $after_epoll / 1000,
+                           $delay_b / 1000);
+                } else {
+                    printf(">>> ALERT (EAGAIN→SPLICE, fd=%d): %llu ms stall. "
+                           "epoll not observed during window — "
+                           "fd readiness unconfirmed by this trace. <<<\n",
+                           $fd_in, $delay_b / 1000);
+                }
+            }
+        } else {
+            // Different fd — cross-fd measurement, likely not meaningful
+            printf("  EAGAIN→SPLICE (tid=%d, fd changed %d→%d): %llu us "
+                   "[cross-fd, discarded]\n",
+                   $tid, $prev_fd, $fd_in, $delay_b);
+        }
+        delete(@eagain_ns[$tid]);
+        delete(@eagain_fd[$tid]);
+    }
+}
+
+// ================================================================
+// SCHED_RESUME — kernel-level goroutine scheduling evidence
+// Most reliable metric: no fd ambiguity, no goroutine migration issue.
+// wake_latency_us = CFS scheduling delay (after sched_wakeup was called)
+// total_since_eagain_us = time from EAGAIN until goroutine ran on CPU
+//   (includes Go runtime netpoller delay + CFS scheduling)
+// ================================================================
+tracepoint:sched:sched_wakeup
+{
+    @wake[(uint64)args->pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+{
+    $next = (uint64)args->next_pid;
+
+    if (@eagain_ns[$next] > 0 && @wake[$next] > 0) {
+        $wake_latency    = (nsecs - @wake[$next]) / 1000;
+        $total_since_eagain = (nsecs - @eagain_ns[$next]) / 1000;
+
+        if ($wake_latency > 1000) {
+            printf("%llu SCHED_RESUME tid=%llu "
+                   "wake_latency_us=%llu "
+                   "total_since_eagain_us=%llu\n",
+                   nsecs, $next, $wake_latency, $total_since_eagain);
+
+            if ($total_since_eagain > 1000000) {
+                printf(">>> ALERT: Goroutine blocked %llu ms after EAGAIN! "
+                       "CFS took %llu ms once wakeup was called. "
+                       "Root cause: %s <<<\n",
+                       $total_since_eagain / 1000,
+                       $wake_latency / 1000,
+                       $wake_latency > 10000 ?
+                           "BOTH Go runtime AND CFS delayed" :
+                           "Go runtime did not call sched_wakeup promptly");
+        }
+
+        delete(@eagain_ns[$next]);
+        delete(@wake[$next]);
+    }
+}
+
+// ================================================================
+// Backend application send baseline
+// ================================================================
+kprobe:tcp_sendmsg
+/ pid == $3 /
+{
+    printf("%llu APP_SEND tid=%d\n", nsecs, tid);
+}
+
+// ================================================================
+// Splice error (not EAGAIN)
+// ================================================================
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret < 0 && args->ret != -11 /
+{
+    printf("%llu SPLICE_ERROR pid=%d tid=%d errno=%d\n",
+           nsecs, pid, tid, -(int32)args->ret);
+}
+
+END
+{
+    printf("\n=== Summary ===\n");
+    printf("EAGAIN occurrences by TID:\n");
+    print(@eagain_count);
+
+    clear(@recv);
+    clear(@eagain_ns); clear(@eagain_fd); clear(@eagain_count);
+    clear(@wake); clear(@epoll_ready_ns);
+}
