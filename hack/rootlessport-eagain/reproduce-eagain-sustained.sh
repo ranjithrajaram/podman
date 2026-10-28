@@ -308,7 +308,7 @@ if podman image exists "$JAVA_IMAGE" 2>/dev/null; then
         --volume "$APP_DIR:/app:ro,z" \
         --env   "BODY_SIZE=${BODY_SIZE}" \
         "$JAVA_IMAGE" \
-        sh -c "cd /app && javac LargeResponseServer.java && java LargeResponseServer"
+        sh -c "mkdir -p /tmp/cls && javac -d /tmp/cls /app/LargeResponseServer.java && java -cp /tmp/cls LargeResponseServer"
 else
     # Java image not available locally — fall back to Python server
     info "Java image '$JAVA_IMAGE' not found locally — falling back to Python"
