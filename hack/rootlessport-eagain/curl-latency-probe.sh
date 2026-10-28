@@ -6,7 +6,7 @@
 # visible — this is more useful than aggregate stats for spotting EAGAIN spikes.
 #
 # Usage:
-#   bash curl-latency-probe.sh <host> [port] [requests] [slow-ms] [--stop-on-slow]
+#   bash curl-latency-probe.sh <host> [port] [requests] [slow-ms] [--stop-on-slow] [--interval S]
 #
 # Arguments:
 #   host         Target IP or hostname
@@ -16,18 +16,22 @@
 #
 # Options:
 #   --stop-on-slow   Stop immediately when the first slow request is detected
-#                    and print a full summary.  Without this flag the probe
-#                    continues for all <requests> regardless of slow responses.
+#                    and print a full summary.
+#   --interval S     Wait S seconds between probes (default: 0 = back-to-back).
+#                    Useful to simulate periodic monitoring (e.g. --interval 30).
 #
 # Examples:
-#   # Run 30 requests, flag >500ms
+#   # Run 30 back-to-back requests, flag >500ms
 #   bash curl-latency-probe.sh 192.168.122.192
 #
 #   # Run until a delay >1000ms is seen, then stop
 #   bash curl-latency-probe.sh 192.168.122.192 18081 0 1000 --stop-on-slow
 #
-#   # Fixed 60 requests, flag >1000ms, stop on first slow
-#   bash curl-latency-probe.sh 192.168.122.192 18081 60 1000 --stop-on-slow
+#   # Probe every 30 seconds indefinitely, stop on first slow response
+#   bash curl-latency-probe.sh 192.168.122.192 18081 0 1000 --stop-on-slow --interval 30
+#
+#   # Fixed 60 probes with 10-second gap between each
+#   bash curl-latency-probe.sh 192.168.122.192 18081 60 500 --interval 10
 
 HOST="${1:?Usage: $0 <host> [port] [requests] [slow-ms] [--stop-on-slow]}"
 PORT="${2:-18081}"
@@ -35,8 +39,13 @@ REQUESTS="${3:-30}"
 SLOW_MS="${4:-500}"
 
 STOP_ON_SLOW=0
-for arg in "$@"; do
-    [[ "$arg" == "--stop-on-slow" ]] && STOP_ON_SLOW=1
+INTERVAL=0
+args=("$@")
+for idx in "${!args[@]}"; do
+    [[ "${args[$idx]}" == "--stop-on-slow" ]] && STOP_ON_SLOW=1
+    if [[ "${args[$idx]}" == "--interval" ]]; then
+        INTERVAL="${args[$((idx+1))]:-0}"
+    fi
 done
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; NC='\033[0m'
@@ -51,6 +60,9 @@ else
     echo "Requests     : $REQUESTS sequential"
 fi
 echo "Slow flag    : > ${SLOW_MS} ms"
+if [[ "$INTERVAL" -gt 0 ]]; then
+    echo "Interval     : ${INTERVAL}s between probes"
+fi
 if [[ "$STOP_ON_SLOW" -eq 1 ]]; then
     echo "Mode         : stop on first slow response"
 fi
@@ -108,6 +120,13 @@ while true; do
     # Stop after fixed request count (0 = unlimited)
     if [[ "$REQUESTS" -gt 0 && "$i" -ge "$REQUESTS" ]]; then
         break
+    fi
+
+    # Wait between probes if interval is set
+    if [[ "$INTERVAL" -gt 0 ]]; then
+        printf "  %s  (next probe in %ss)\r" "$(date +'%H:%M:%S')" "$INTERVAL"
+        sleep "$INTERVAL"
+        printf "%-60s\r" ""   # clear the waiting line
     fi
 done
 
