@@ -22,11 +22,15 @@
 #        pace and prints each response time.
 #
 # Pod layout:
-#   host:ENVOY_PORT  ──► rootlessport ──► envoy:8080 ──► python-app:8081
+#   host:ENVOY_PORT  ──► rootlessport ──► envoy:8080 ──► java-app:8081
 #   (sustained background, low CPU)      [pod-local after Envoy, no rootlessport]
 #
-#   host:DIRECT_PORT ──► rootlessport ──► python-app:8081
+#   host:DIRECT_PORT ──► rootlessport ──► java-app:8081
 #   (curl probe — latency observed here)
+#
+# Backend: Java HTTP server using com.sun.net.httpserver (built-in JDK).
+#   Fixed thread pool (default 200 threads) mirrors WildFly/Tomcat behaviour.
+#   Falls back to Python ThreadingHTTPServer if Java image is not available.
 #
 # Usage:
 #   bash rootlessport-sustained-reproducer.sh [OPTIONS]
@@ -76,7 +80,8 @@ NO_CLEANUP=0
 POD_NAME="eagain-sustained-pod"
 NETWORK_NAME="eagain-sustained-net"
 ENVOY_IMAGE="docker.io/envoyproxy/envoy:v1.29-latest"
-PYTHON_IMAGE="docker.io/library/python:3.11-slim"
+PYTHON_IMAGE="docker.io/library/python:3.11-slim"   # fallback if Java image absent
+JAVA_IMAGE="docker.io/eclipse-temurin:21-jdk-alpine" # preferred: matches production JVM
 
 TMPDIR_ROOT="$(mktemp -d /tmp/eagain-sustained.XXXXXX)"
 
@@ -232,18 +237,89 @@ podman run -d \
 ok "Envoy started"
 
 # ---------------------------------------------------------------------------
-step "Write Python app"
+step "Write Java backend app"
 # ---------------------------------------------------------------------------
+# Uses com.sun.net.httpserver.HttpServer (built into JDK — no Maven/Gradle).
+# A fixed-size thread pool mirrors WildFly/Tomcat behaviour: each request
+# is handled by a dedicated thread, matching the production load pattern
+# that creates goroutine pressure in rootlessport.
 APP_DIR="$TMPDIR_ROOT/app"
 mkdir -p "$APP_DIR"
-cat > "$APP_DIR/server.py" <<PYEOF
-#!/usr/bin/env python3
-import os, time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+cat > "$APP_DIR/LargeResponseServer.java" <<'JAVAEOF'
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.net.*;
+import java.util.Arrays;
+import java.util.concurrent.*;
+
+/**
+ * Minimal JDK HTTP server for rootlessport EAGAIN reproducer.
+ *
+ * Serves BODY_SIZE bytes per GET request from a fixed thread pool,
+ * mirroring the thread-pool behaviour of WildFly/Tomcat that was
+ * observed in production when the EAGAIN stalls occurred.
+ *
+ * Environment variables:
+ *   BODY_SIZE  – response body bytes (default 1 048 576 = 1 MB)
+ *   THREADS    – thread pool size     (default 200)
+ *   PORT       – listen port          (default 8081)
+ */
+public class LargeResponseServer {
+
+    public static void main(String[] args) throws Exception {
+        int port     = Integer.parseInt(System.getenv().getOrDefault("PORT",      "8081"));
+        int bodySize = Integer.parseInt(System.getenv().getOrDefault("BODY_SIZE", "1048576"));
+        int threads  = Integer.parseInt(System.getenv().getOrDefault("THREADS",   "200"));
+
+        byte[] body = new byte[bodySize];
+        Arrays.fill(body, (byte) 'A');
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
+
+        server.createContext("/", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
+            exchange.getResponseHeaders().set("Connection",   "close");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(body);
+            }
+        });
+
+        // Fixed thread pool — same model as Tomcat NIO connector / WildFly undertow
+        server.setExecutor(Executors.newFixedThreadPool(threads));
+        server.start();
+
+        System.out.printf(
+            "Java backend: port=%d body=%d B threads=%d%n",
+            port, bodySize, threads);
+        System.out.flush();
+    }
+}
+JAVAEOF
+
+# Decide which image to use: Java if available, Python as fallback
+APP_CONTAINER_NAME="java-app"
+if podman image exists "$JAVA_IMAGE" 2>/dev/null; then
+    info "Using Java image: $JAVA_IMAGE"
+    podman run -d \
+        --name "$APP_CONTAINER_NAME" \
+        --pod  "$POD_NAME" \
+        --volume "$APP_DIR:/app:ro,z" \
+        --env   "BODY_SIZE=${BODY_SIZE}" \
+        "$JAVA_IMAGE" \
+        sh -c "cd /app && javac LargeResponseServer.java && java LargeResponseServer"
+else
+    # Java image not available locally — fall back to Python server
+    info "Java image '$JAVA_IMAGE' not found locally — falling back to Python"
+    info "To use Java: podman pull $JAVA_IMAGE"
+    APP_CONTAINER_NAME="python-app"
+    cat > "$APP_DIR/server.py" <<PYEOF
+#!/usr/bin/env python3
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BODY_SIZE = int(os.environ.get("BODY_SIZE", "${BODY_SIZE}"))
 BODY      = b"A" * BODY_SIZE
-
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -252,23 +328,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(BODY)
-    def log_message(self, fmt, *args):
-        pass
-
+    def log_message(self, fmt, *args): pass
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", 8081), Handler)
-    print(f"Python app: {BODY_SIZE} B/response on :8081", flush=True)
+    print(f"Python fallback: {BODY_SIZE} B/response on :8081", flush=True)
     server.serve_forever()
 PYEOF
-
-podman run -d \
-    --name python-app \
-    --pod  "$POD_NAME" \
-    --volume "$APP_DIR:/app:ro,z" \
-    --env   "BODY_SIZE=${BODY_SIZE}" \
-    "$PYTHON_IMAGE" \
-    python3 /app/server.py
-ok "Python app started"
+    podman run -d \
+        --name "$APP_CONTAINER_NAME" \
+        --pod  "$POD_NAME" \
+        --volume "$APP_DIR:/app:ro,z" \
+        --env   "BODY_SIZE=${BODY_SIZE}" \
+        "$PYTHON_IMAGE" \
+        python3 /app/server.py
+fi
+ok "Backend app started ($APP_CONTAINER_NAME)"
 
 # ---------------------------------------------------------------------------
 step "Wait for readiness (up to 90 s)"
