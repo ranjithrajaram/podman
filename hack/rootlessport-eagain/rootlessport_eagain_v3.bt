@@ -141,7 +141,7 @@ tracepoint:syscalls:sys_exit_splice
    This is the primary trigger for stopping the script.
 
    wake_latency_us    = time from sched_wakeup to goroutine running
-                        (CFS scheduling delay — expected < 5 ms)
+                        (CFS scheduling delay - expected < 5 ms)
    total_since_eagain = time from SPLICE_EAGAIN to goroutine running
                         (Go runtime delay + CFS)
 
@@ -166,7 +166,7 @@ tracepoint:sched:sched_switch
                    $next, $wl, $tot);
         }
 
-        /* THRESHOLD EXCEEDED — print evidence report and stop */
+        /* THRESHOLD EXCEEDED - print evidence report and stop */
         if ($tot > @threshold_us) {
             $fd            = @eagain_fd[$next];
             $eagain_time   = @eagain_ns[$next];
@@ -175,7 +175,7 @@ tracepoint:sched:sched_switch
 
             printf("\n");
             printf("================================================================\n");
-            printf("  EAGAIN SCHEDULER STALL CONFIRMED — STOPPING\n");
+            printf("  EAGAIN SCHEDULER STALL CONFIRMED - STOPPING\n");
             printf("================================================================\n");
             printf("\n");
             printf("  Thread (OS tid)       : %llu\n", $next);
