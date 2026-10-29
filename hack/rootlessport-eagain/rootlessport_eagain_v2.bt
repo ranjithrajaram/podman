@@ -77,15 +77,25 @@ tracepoint:syscalls:sys_exit_epoll_pwait
 }
 
 /* ================================================================
+   Capture fd_in at splice entry - field is NOT available at exit.
+   ================================================================ */
+tracepoint:syscalls:sys_enter_splice
+/ pid == $1 || pid == $2 /
+{
+    @enter_fd[tid] = args->fd_in;
+}
+
+/* ================================================================
    SPLICE_EAGAIN - track per (tid, fd_in) for same-fd matching.
    ================================================================ */
 tracepoint:syscalls:sys_exit_splice
 / (pid == $1 || pid == $2) && args->ret == -11 /
 {
-    $fd = args->fd_in;
+    $fd = @enter_fd[tid];
     @eagain_ns[tid]  = nsecs;
     @eagain_fd[tid]  = $fd;
     @eagain_count[tid]++;
+    delete(@enter_fd[tid]);
 
     printf("%llu SPLICE_EAGAIN pid=%d tid=%d fd_in=%d count=%llu\n",
            nsecs, pid, tid, $fd, @eagain_count[tid]);
@@ -110,7 +120,8 @@ tracepoint:syscalls:sys_exit_splice
 / (pid == $1 || pid == $2) && args->ret > 0 /
 {
     $tid  = tid;
-    $fd   = args->fd_in;
+    $fd   = @enter_fd[$tid];
+    delete(@enter_fd[$tid]);
 
     /* ---- Measurement A: RECV->SPLICE (same tid) ---- */
     if (@recv[$tid] > 0) {
@@ -211,6 +222,7 @@ kprobe:tcp_sendmsg
 tracepoint:syscalls:sys_exit_splice
 / (pid == $1 || pid == $2) && args->ret < 0 && args->ret != -11 /
 {
+    delete(@enter_fd[tid]);
     printf("%llu SPLICE_ERROR pid=%d tid=%d errno=%d\n",
            nsecs, pid, tid, -(int32)args->ret);
 }
@@ -221,6 +233,7 @@ END
     printf("EAGAIN occurrences by TID:\n");
     print(@eagain_count);
     clear(@recv);
+    clear(@enter_fd);
     clear(@eagain_ns); clear(@eagain_fd); clear(@eagain_count);
     clear(@wake); clear(@epoll_ready_ns);
 }
