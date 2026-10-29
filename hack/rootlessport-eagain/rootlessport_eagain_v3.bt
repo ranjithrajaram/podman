@@ -1,0 +1,245 @@
+#!/usr/bin/env bpftrace
+/*
+ * rootlessport_eagain_v3.bt - Self-stopping EAGAIN scheduler stall detector
+ *
+ * Monitors rootlessport for Go scheduler wakeup delays after splice(2) EAGAIN
+ * and exits the moment a stall exceeding THRESHOLD_MS is confirmed.
+ * Prints a structured evidence report at the moment of detection.
+ *
+ * The primary detection mechanism is SCHED_RESUME (kernel sched_switch
+ * tracepoint): no fd ambiguity, no goroutine migration issue.
+ * A secondary annotation shows when epoll_pwait confirmed fd readiness
+ * during the stall window, directly addressing the question
+ * "was the fd actually ready?".
+ *
+ * Usage:
+ *   BPFTRACE_MAX_MAP_KEYS=65536 bpftrace rootlessport_eagain_v3.bt \
+ *       <rootlessport-parent-pid> \
+ *       <rootlessport-child-pid> \
+ *       <backend-app-pid-or-0>  \
+ *       [threshold-ms]          (default: 1000 ms)
+ *
+ * Examples:
+ *   # Stop on first stall > 1s (default)
+ *   bpftrace rootlessport_eagain_v3.bt 70191 70197 70250
+ *
+ *   # Stop on first stall > 500 ms
+ *   bpftrace rootlessport_eagain_v3.bt 70191 70197 70250 500
+ */
+
+BEGIN
+{
+    @threshold_us = $4 > 0 ? ($4 * 1000) : 1000000;
+    printf("rootlessport_eagain_v3: watching for EAGAIN stall > %llu ms\n",
+           @threshold_us / 1000);
+    printf("parent=%d child=%d app=%d\n\n", $1, $2, $3);
+    printf("Waiting for scheduler stall...\n");
+}
+
+/* ================================================================
+   Capture fd_in at splice entry (not available at exit tracepoint)
+   ================================================================ */
+tracepoint:syscalls:sys_enter_splice
+/ pid == $1 || pid == $2 /
+{
+    @enter_fd[tid] = args->fd_in;
+}
+
+/* ================================================================
+   RECV: record when data arrived at rootlessport (SCM_RIGHTS path)
+   ================================================================ */
+tracepoint:syscalls:sys_exit_recvmsg
+/ (pid == $1 || pid == $2) && args->ret > 0 /
+{
+    @recv_ns[tid]    = nsecs;
+    @recv_bytes[tid] = (uint64)args->ret;
+}
+
+/* ================================================================
+   EPOLL_PWAIT: kernel confirms fd readiness.
+   When epoll_pwait(2) returns > 0, at least one fd IS ready.
+   Recorded per-pid; netpoller goroutine may be on a different tid
+   than the goroutine that calls splice later.
+   ================================================================ */
+tracepoint:syscalls:sys_exit_epoll_pwait
+/ (pid == $1 || pid == $2) && (int32)args->ret > 0 /
+{
+    @epoll_ns[pid]   = nsecs;
+    @epoll_nfds[pid] = (uint64)(int32)args->ret;
+}
+
+/* ================================================================
+   SPLICE_EAGAIN: goroutine will park in Go's netpoller.
+   Record the ns timestamp and fd_in (from entry map) keyed by tid.
+   ================================================================ */
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret == -11 /
+{
+    $fd = @enter_fd[tid];
+    @eagain_ns[tid]    = nsecs;
+    @eagain_fd[tid]    = $fd;
+    @eagain_epoll[tid] = @epoll_ns[pid];   /* snapshot epoll state at EAGAIN time */
+    @eagain_count[tid]++;
+    delete(@enter_fd[tid]);
+
+    printf("%llu SPLICE_EAGAIN pid=%d tid=%d fd=%d count=%llu",
+           nsecs, pid, tid, $fd, @eagain_count[tid]);
+
+    if (@epoll_ns[pid] > 0) {
+        $lag = (nsecs - @epoll_ns[pid]) / 1000;
+        if ($lag < 5000000) {
+            printf("  [epoll_ready %llu us ago]", $lag);
+        }
+    }
+    printf("\n");
+}
+
+/* ================================================================
+   SPLICE_SUCCESS: clean up fd tracking.
+   Also fires RECV->SPLICE delay alert if same-tid and same-fd.
+   ================================================================ */
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret > 0 /
+{
+    $fd = @enter_fd[tid];
+    delete(@enter_fd[tid]);
+
+    if (@recv_ns[tid] > 0) {
+        $dr = (nsecs - @recv_ns[tid]) / 1000;
+        if ($dr > 500000) {
+            printf("%llu RECV->SPLICE delay %llu ms tid=%d\n",
+                   nsecs, $dr / 1000, tid);
+        }
+        delete(@recv_ns[tid]);
+        delete(@recv_bytes[tid]);
+    }
+
+    if (@eagain_ns[tid] > 0) {
+        $de = (nsecs - @eagain_ns[tid]) / 1000;
+        $pf = @eagain_fd[tid];
+        if ($pf == $fd && $de > 500000) {
+            printf("%llu EAGAIN->SPLICE same-tid same-fd=%d: %llu ms\n",
+                   nsecs, $fd, $de / 1000);
+        }
+        delete(@eagain_ns[tid]);
+        delete(@eagain_fd[tid]);
+        delete(@eagain_epoll[tid]);
+    }
+}
+
+/* ================================================================
+   SPLICE_ERROR: clean up fd tracking
+   ================================================================ */
+tracepoint:syscalls:sys_exit_splice
+/ (pid == $1 || pid == $2) && args->ret < 0 && args->ret != -11 /
+{
+    delete(@enter_fd[tid]);
+}
+
+/* ================================================================
+   SCHED_RESUME: kernel-level goroutine scheduling evidence.
+   This is the primary trigger for stopping the script.
+
+   wake_latency_us    = time from sched_wakeup to goroutine running
+                        (CFS scheduling delay — expected < 5 ms)
+   total_since_eagain = time from SPLICE_EAGAIN to goroutine running
+                        (Go runtime delay + CFS)
+
+   If total_since_eagain > threshold, print full evidence and exit.
+   ================================================================ */
+tracepoint:sched:sched_wakeup
+{
+    @wake[(uint64)args->pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+{
+    $next = (uint64)args->next_pid;
+
+    if (@eagain_ns[$next] > 0 && @wake[$next] > 0) {
+        $wl  = (nsecs - @wake[$next]) / 1000;
+        $tot = (nsecs - @eagain_ns[$next]) / 1000;
+
+        /* Log smaller stalls for background visibility */
+        if ($wl > 1000 && $tot > 500000) {
+            printf("SCHED_RESUME tid=%llu wake=%llu us total=%llu us\n",
+                   $next, $wl, $tot);
+        }
+
+        /* THRESHOLD EXCEEDED — print evidence report and stop */
+        if ($tot > @threshold_us) {
+            $fd            = @eagain_fd[$next];
+            $eagain_time   = @eagain_ns[$next];
+            $epoll_at_eagain = @eagain_epoll[$next];
+            $go_hold_ms    = ($tot - $wl) / 1000;
+
+            printf("\n");
+            printf("================================================================\n");
+            printf("  EAGAIN SCHEDULER STALL CONFIRMED — STOPPING\n");
+            printf("================================================================\n");
+            printf("\n");
+            printf("  Thread (OS tid)       : %llu\n", $next);
+            printf("  EAGAIN on fd          : %llu\n", $fd);
+            printf("  Total stall           : %llu ms  (EAGAIN -> goroutine ran)\n",
+                   $tot / 1000);
+            printf("  CFS wake_latency      : %llu ms  (once sched_wakeup called)\n",
+                   $wl / 1000);
+            printf("  Go runtime hold time  : %llu ms  (before sched_wakeup called)\n",
+                   $go_hold_ms);
+            printf("\n");
+
+            /* epoll readiness confirmation */
+            if ($epoll_at_eagain > 0 && @epoll_ns[pid] > $eagain_time) {
+                $epoll_lag = (nsecs - @epoll_ns[pid]) / 1000;
+                printf("  epoll_pwait returned DURING the stall window:\n");
+                printf("    fd was kernel-confirmed ready %llu ms before goroutine ran\n",
+                       $epoll_lag / 1000);
+                printf("  --> CONFIRMED: fd WAS ready; Go runtime did not\n");
+                printf("      call sched_wakeup for %llu ms despite idle CPU\n",
+                       $go_hold_ms);
+            } else {
+                printf("  epoll_pwait not observed during stall window\n");
+                printf("  (fd readiness unconfirmed by this trace)\n");
+            }
+
+            printf("\n");
+            printf("  Root cause: Go's sysmon/netpoller did not call sched_wakeup\n");
+            printf("  for %llu ms.  CFS was fast (%llu ms) once notified.\n",
+                   $go_hold_ms, $wl / 1000);
+            printf("  Fix: poll(-1)+LockOSThread bypasses Go scheduler entirely.\n");
+            printf("\n");
+            printf("================================================================\n");
+
+            exit();
+        }
+
+        delete(@eagain_ns[$next]);
+        delete(@eagain_fd[$next]);
+        delete(@eagain_epoll[$next]);
+        delete(@wake[$next]);
+    }
+}
+
+/* ================================================================
+   Backend application traffic baseline
+   ================================================================ */
+kprobe:tcp_sendmsg
+/ pid == $3 /
+{
+    @app_sends++;
+}
+
+END
+{
+    printf("\n=== Session summary ===\n");
+    printf("EAGAIN counts by TID:\n");
+    print(@eagain_count);
+    printf("App sends: ");
+    print(@app_sends);
+
+    clear(@enter_fd);  clear(@recv_ns);      clear(@recv_bytes);
+    clear(@epoll_ns);  clear(@epoll_nfds);
+    clear(@eagain_ns); clear(@eagain_fd);    clear(@eagain_epoll);
+    clear(@eagain_count);
+    clear(@wake);      clear(@threshold_us); clear(@app_sends);
+}
