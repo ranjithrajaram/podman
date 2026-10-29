@@ -191,12 +191,29 @@ tracepoint:sched:sched_switch
             /* epoll readiness confirmation */
             if ($epoll_at_eagain > 0 && @epoll_ns[pid] > $eagain_time) {
                 $epoll_lag = (nsecs - @epoll_ns[pid]) / 1000;
-                printf("  epoll_pwait returned DURING the stall window:\n");
-                printf("    fd was kernel-confirmed ready %llu ms before goroutine ran\n",
-                       $epoll_lag / 1000);
-                printf("  --> CONFIRMED: fd WAS ready; Go runtime did not\n");
-                printf("      call sched_wakeup for %llu ms despite idle CPU\n",
-                       $go_hold_ms);
+                /*
+                 * Only treat as confirmed scheduler stall if epoll fired
+                 * significantly BEFORE the goroutine ran (> 50ms).
+                 * If epoll_lag ~ 0ms the fd became ready right when the
+                 * goroutine was scheduled — this is normal data arrival
+                 * (client sent next request after N ms of reading), not
+                 * a scheduler stall.  A real stall shows a large lag
+                 * because the fd was ready early but sysmon delayed.
+                 */
+                if ($epoll_lag > 50000) {
+                    printf("  epoll_pwait returned DURING the stall window:\n");
+                    printf("    fd was kernel-confirmed ready %llu ms before goroutine ran\n",
+                           $epoll_lag / 1000);
+                    printf("  --> CONFIRMED: fd WAS ready; Go runtime did not\n");
+                    printf("      call sched_wakeup for %llu ms despite idle CPU\n",
+                           $go_hold_ms);
+                } else {
+                    printf("  epoll fired %llu us before goroutine ran (essentially simultaneous)\n",
+                           $epoll_lag);
+                    printf("  --> LIKELY FALSE POSITIVE: data arrived at end of wait;\n");
+                    printf("      goroutine was correctly parked waiting for client data.\n");
+                    printf("      Not a scheduler stall - normal network wait time.\n");
+                }
             } else {
                 printf("  epoll_pwait not observed during stall window\n");
                 printf("  (fd readiness unconfirmed by this trace)\n");
