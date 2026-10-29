@@ -152,8 +152,20 @@ tracepoint:syscalls:sys_exit_splice
                              @epoll_ready_ns[pid] < nsecs);
                 if ($epoll_ok) {
                     $lag2 = (nsecs - @epoll_ready_ns[pid]) / 1000;
-                    printf(">>> CONFIRMED ALERT: fd=%d kernel-confirmed ready %llu ms before splice. Stall=%llu ms. fd WAS ready - goroutine not scheduled. <<<\n",
-                           $fd, $lag2 / 1000, $db / 1000);
+                    /*
+                     * Only CONFIRMED if epoll fired well before the goroutine ran.
+                     * If lag2 ~ 0us, data arrived at the end of the wait period
+                     * (normal: client sent next request after N ms of reading).
+                     * A real scheduler stall shows large lag2 because fd was ready
+                     * early but Go's sysmon delayed calling sched_wakeup.
+                     */
+                    if ($lag2 > 50000) {
+                        printf(">>> CONFIRMED ALERT: fd=%d kernel-confirmed ready %llu ms before splice. Stall=%llu ms. fd WAS ready - goroutine not scheduled. <<<\n",
+                               $fd, $lag2 / 1000, $db / 1000);
+                    } else {
+                        printf(">>> LIKELY FALSE POSITIVE (fd=%d): epoll fired %llu us before splice (simultaneous). Data arrived at end of wait - normal network wait, not scheduler stall. <<<\n",
+                               $fd, $lag2);
+                    }
                 } else {
                     printf(">>> ALERT (EAGAIN->SPLICE fd=%d): %llu ms stall. epoll not observed - fd readiness unconfirmed. <<<\n",
                            $fd, $db / 1000);
