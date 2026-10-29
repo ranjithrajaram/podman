@@ -29,9 +29,9 @@
 
 BEGIN
 {
-    @threshold_us = $4 > 0 ? ($4 * 1000) : 1000000;
+    @threshold_us = (uint64)($4 > 0 ? $4 * 1000 : 1000000);
     printf("rootlessport_eagain_v3: watching for EAGAIN stall > %llu ms\n",
-           @threshold_us / 1000);
+           (uint64)@threshold_us / 1000);
     printf("parent=%d child=%d app=%d\n\n", $1, $2, $3);
     printf("Waiting for scheduler stall...\n");
 }
@@ -167,7 +167,7 @@ tracepoint:sched:sched_switch
         }
 
         /* THRESHOLD EXCEEDED - print evidence report and stop */
-        if ($tot > @threshold_us) {
+        if ($tot > (uint64)@threshold_us) {
             $fd            = @eagain_fd[$next];
             $eagain_time   = @eagain_ns[$next];
             $epoll_at_eagain = @eagain_epoll[$next];
